@@ -41,7 +41,7 @@
     "chai": "^4",
     "mocha": "^9",
     "nodemon": "^2",
-    "statefull-api": "file:../api",
+    "statefull-api": "^0.0.1",
     "ts-node": "^10",
     "typescript": "^4"
   },
