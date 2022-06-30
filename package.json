@@ -1,7 +1,7 @@
 {
   "name": "statefull",
   "description": "Statfull websocket node system.",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "main": "dist/index.js",
   "author": "majo418",
   "license": "MIT",
