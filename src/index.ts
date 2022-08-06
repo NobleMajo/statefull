@@ -5,71 +5,110 @@ import {
     WebSocket,
 } from "ws"
 import { createSecretHash } from "./hash"
-import { Node, StatefullNodeSettings, WsEndpoint, SocketData, StatefullNodeOptions, defaultStatefullApiSettings } from './types';
 import { Application } from "express"
 import * as express from 'express';
-import * as JWT from 'jsonwebtoken';
 import { StatefullExportSettings, StatefullNodeExportSettings } from 'statefull-api/dist/types';
+import { JsonTypes } from "majotools/dist/json"
+import { StatefullWebSocket } from './StatefullWebSocket';
+import { ServerOptions } from 'ws';
+import { JsonObject } from './json';
 
-export let lastWsNumber: number = 0
+export type Awaitable<T> = Promise<T> | PromiseLike<T> | T
 
-export function getWebSocketEndpoint(
-    sock: WebSocket,
-    req: IncomingMessage,
+export interface Node {
+    id: number,
+    heartbeat: number,
+    url: string,
+}
+
+export interface Session {
+    id: string,
+    new: boolean,
+    [key: string]: JsonTypes
+}
+export interface StatefullNodeOptions {
+    apiUrl: string,
+    externalUrl: string,
+
+    onInit: (node: StatefullNode, sfws: StatefullWebSocket) => Awaitable<JsonObject>
+    onData: (node: StatefullNode, sfws: StatefullWebSocket, data: JsonObject) => Awaitable<void>
+
+    onLeave?: (node: StatefullNode, sfws: StatefullWebSocket) => Awaitable<void>
+    onError?: (node: StatefullNode, err: Error | any, sfws?: StatefullWebSocket) => Awaitable<void>,
+    onApiTimeout?: (node: StatefullNode, msg: string, err: Error | any) => Awaitable<void>,
+
+    wsOptions?: ServerOptions,
+    behindProxy?: boolean,
+
+    nodeHeartbeatVariance?: number,
+    settingsFetchDelayFaktor?: number,
+    nodeSecret?: string,
+
+    maxReconnectRetryDelay?: number,
+    minReconnectRetryDelay?: number,
+    reconnectRetryDelayIncrease?: number,
+
+    maxRequestBodySize?: number,
+    maxRequestTimeoutMillis?: number,
+    requestAttempt?: number,
+}
+
+export interface StatefullNodeSettings {
+    apiUrl: string,
+    externalUrl: string,
+
+    onInit: (node: StatefullNode, sfws: StatefullWebSocket) => Awaitable<JsonObject>
+    onData: (node: StatefullNode, sfws: StatefullWebSocket, data: JsonObject) => Awaitable<void>
+
+    onLeave: (node: StatefullNode, sfws: StatefullWebSocket) => Awaitable<void>
+    onError: (node: StatefullNode, err: Error | any, sfws?: StatefullWebSocket) => Awaitable<void>
+    onApiTimeout: (node: StatefullNode, msg: string, err: Error | any) => Awaitable<void>,
+
+    wsOptions: ServerOptions,
     behindProxy: boolean,
-): WsEndpoint {
-    let address: string
-    if (behindProxy) {
-        address = (
-            req.headers["x-forwarded-for"] ??
-            req.headers["CF-Connecting-IP"] ??
-            req.headers["True-Client-IP"] ??
-            req.socket.remoteAddress
-        ) as any
-        if (Array.isArray(address)) {
-            if (address.length == 0) {
-                address = undefined
-            } else {
-                address = address[0]
-            }
-        }
-    } else {
-        address = req.socket.remoteAddress
-    }
-    if (
-        typeof address != "string" ||
-        address.length == 0
-    ) {
-        throw new Error("Can't get websocket remote address")
-    }
-    let port: number
-    if (behindProxy) {
-        port = (
-            req.headers["x-forwarded-port"] ??
-            req.headers["CF-Connecting-Port"] ??
-            req.headers["True-Client-Port"] ??
-            req.socket.remotePort
-        ) as any
-        if (Array.isArray(port)) {
-            if (port.length == 0) {
-                port = undefined
-            } else {
-                port = port[0]
-            }
-        }
-        port = Number(port)
-    } else {
-        port = Number(req.socket.remotePort)
-    }
-    if (isNaN(port)) {
-        throw new Error("Can't get websocket remote port")
-    }
-    return {
-        address,
-        port,
-        id: address + ":" + port,
-        nid: lastWsNumber++,
-    }
+
+    nodeHeartbeatVariance: number,
+    settingsFetchDelayFaktor: number,
+    nodeSecret: string,
+
+    maxReconnectRetryDelay: number,
+    minReconnectRetryDelay: number,
+    reconnectRetryDelayIncrease: number,
+
+    maxRequestBodySize: number,
+    maxRequestTimeoutMillis: number,
+    requestAttempt: number,
+}
+
+export const defaultStatefullApiSettings: StatefullNodeSettings = {
+    apiUrl: undefined as any,
+    externalUrl: undefined as any,
+
+    onInit: undefined as any,
+    onData: undefined as any,
+
+    onLeave: (node, sfws) => console.info("onLeave():\nClient: " + sfws.ep.id),
+    onError: (node, err, sfws) => console.error("onError():\n" + err.stack.split("\n").join("  \n")),
+    onApiTimeout: (node, msg, err) => console.error("onApiTimeout():\n" + msg.split("\n").join("  \n"), "\n", err),
+
+    wsOptions: {
+        port: 8080,
+        host: "0.0.0.0",
+    },
+    behindProxy: true,
+
+    nodeHeartbeatVariance: 1000 * 5,
+    settingsFetchDelayFaktor: 10,
+
+    nodeSecret: "Some1Random2Node3Secret4_5.6",
+
+    maxReconnectRetryDelay: 1000 * 60 * 5,
+    minReconnectRetryDelay: 1000 * 4,
+    reconnectRetryDelayIncrease: 1000,
+
+    maxRequestBodySize: 1024 * 1024 * 32,
+    maxRequestTimeoutMillis: 1000 * 16,
+    requestAttempt: 8,
 }
 
 export class StatefullNode {
@@ -84,7 +123,7 @@ export class StatefullNode {
 
     heartbeatId: number
     sockets: {
-        [id: string]: SocketData
+        [id: string]: StatefullWebSocket
     } = {}
 
     constructor(
@@ -101,36 +140,40 @@ export class StatefullNode {
     }
 
     async fetchBaseApiSettings(): Promise<StatefullExportSettings> {
+        console.log("base settings: ", this.settings.apiUrl + "/statefull.json")
+
         const resp = await fetch(
             this.settings.apiUrl + "/statefull.json",
+            {
+                follow: 16,
+                redirect: "follow",
+                compress: true,
+                size: this.settings.maxRequestBodySize,
+                timeout: this.settings.maxRequestTimeoutMillis,
+            },
         )
-        if (resp.status != 200) {
+
+        if (resp.status !== 200) {
             throw new Error(
                 "fetchBaseApiSettings(): Status is not 200 on " +
-                this.settings.apiUrl + "/statefull.json" + ":\n" +
+                this.settings.apiUrl + "/statefull.json:\n" +
                 resp.status + ": " + resp.statusText + ":\n" +
                 await resp.text()
             )
         }
         const data: StatefullNodeExportSettings = await resp.json()
-        if (
-            typeof data.externalUrl != "string"
-        ) {
+        console.log("base settings: ", data)
+
+        if (typeof data.externalUrl !== "string") {
             throw new Error("Invalid export settings.\n'externalUrl' is not a string")
         }
-        if (
-            typeof data.nodeHashIterations != "number"
-        ) {
+        if (typeof data.nodeHashIterations !== "number") {
             throw new Error("Invalid export settings.\n'nodeHashIterations' is not a number")
         }
-        if (
-            typeof data.nodeHashAlgorithm != "string"
-        ) {
+        if (typeof data.nodeHashAlgorithm !== "string") {
             throw new Error("Invalid export settings.\n'nodeHashAlgorithm' is not a string")
         }
-        if (
-            typeof data.jwtRequestPrefix != "string"
-        ) {
+        if (typeof data.jwtRequestPrefix !== "string") {
             throw new Error("Invalid export settings.\n'jwtRequestPrefix' is not a string")
         }
         while (data.externalUrl.endsWith("/")) {
@@ -152,7 +195,7 @@ export class StatefullNode {
                     method: "get",
                 }
             )
-            if (resp.status != 200) {
+            if (resp.status !== 200) {
                 throw new Error(
                     "fetchNodeSettings(): Status is not 200 on " +
                     this.settings.apiUrl + "/statefull.json" + ":\n" +
@@ -161,38 +204,39 @@ export class StatefullNode {
                 )
             }
             const data: StatefullNodeExportSettings = await resp.json()
+            console.log("node settings: ", data)
             if (
-                typeof data.externalUrl != "string"
+                typeof data.externalUrl !== "string"
             ) {
                 throw new Error("Invalid export settings.\n'externalUrl' is not a string")
             }
             if (
-                typeof data.nodeHashKeylen != "number"
+                typeof data.nodeHashKeylen !== "number"
             ) {
                 throw new Error("Invalid export settings.\n'nodeHashKeylen' is not a number")
             }
             if (
-                typeof data.nodeHashIterations != "number"
+                typeof data.nodeHashIterations !== "number"
             ) {
                 throw new Error("Invalid export settings.\n'nodeHashIterations' is not a number")
             }
             if (
-                typeof data.nodeHashAlgorithm != "string"
+                typeof data.nodeHashAlgorithm !== "string"
             ) {
                 throw new Error("Invalid export settings.\n'nodeHashAlgorithm' is not a string")
             }
             if (
-                typeof data.jwtRequestPrefix != "string"
+                typeof data.jwtRequestPrefix !== "string"
             ) {
                 throw new Error("Invalid export settings.\n'jwtRequestPrefix' is not a string")
             }
             if (
-                typeof data.jwtSecret != "string"
+                typeof data.jwtSecret !== "string"
             ) {
                 throw new Error("Invalid export settings.\n'jwtRequestPrefix' is not a string")
             }
             if (
-                typeof data.nodeHeartbeatTimeout != "number"
+                typeof data.nodeHeartbeatTimeout !== "number"
             ) {
                 throw new Error("Invalid export settings.\n'nodeHeartbeatTimeout' is not a number")
             }
@@ -208,15 +252,15 @@ export class StatefullNode {
 
     async apiFetch(
         path: string,
-        init: RequestInit = {}
+        init: RequestInit & { method: string }
     ): Promise<Response> {
         try {
             while (path.startsWith("/")) {
                 path = path.substring(1)
             }
-            const millis = Date.now()
+            const millis: number = Date.now()
             const data = await createSecretHash({
-                value: this.settings.nodeSecret,
+                value: millis + this.settings.nodeSecret + millis,
                 algorithm: this.nodeSettings.nodeHashAlgorithm,
                 iterations: this.nodeSettings.nodeHashIterations,
                 keylen: this.nodeSettings.nodeHashKeylen,
@@ -224,20 +268,20 @@ export class StatefullNode {
             if (!init.headers) {
                 init.headers = {}
             }
-            if (this.node != undefined) {
+            if (this.node !== undefined) {
                 init.headers[this.nodeSettings.nodeIdHeader] = "" + this.node.id
             }
-
             let resp: Response
             let i = 0
+
             while (true) {
                 try {
                     resp = await fetch(
                         this.nodeSettings.externalUrl + "/" + path,
                         {
-                            method: "post",
+                            follow: 16,
+                            redirect: "follow",
                             compress: true,
-                            follow: 20,
                             size: this.settings.maxRequestBodySize,
                             timeout: this.settings.maxRequestTimeoutMillis,
                             ...init,
@@ -274,18 +318,19 @@ export class StatefullNode {
                 await this.sendHeartbeat(true)
             } catch (err) { }
             if (
-                typeof this.node != "object" ||
-                typeof this.node.id != "number"
+                typeof this.node !== "object" ||
+                typeof this.node.id !== "number"
             ) {
                 const resp = await this.apiFetch(
                     "/node/register",
                     {
+                        method: "post",
                         headers: {
                             [this.nodeSettings.nodeUrlHeader]: "" + this.settings.externalUrl,
                         },
                     }
                 )
-                if (resp.status != 200) {
+                if (resp.status !== 200) {
                     const err: any = new Error(
                         "Status is not '200' on node register: " +
                         resp.status + ": " +
@@ -299,8 +344,8 @@ export class StatefullNode {
 
                 this.node = await resp.json()
                 if (
-                    typeof this.node != "object" ||
-                    typeof this.node.id != "number"
+                    typeof this.node !== "object" ||
+                    typeof this.node.id !== "number"
                 ) {
                     throw new Error("Register response not contains node")
                 }
@@ -317,7 +362,7 @@ export class StatefullNode {
                         while (
                             this.running &&
                             this.ready &&
-                            this.heartbeatId == hbId
+                            this.heartbeatId === hbId
                         ) {
                             await this.sendHeartbeat()
                             if (
@@ -336,9 +381,8 @@ export class StatefullNode {
                         }
                     } catch (err) {
                         try {
-                            await this.internClose()
+                            await this.closeWebSocketServer()
                         } catch (err) { }
-                        await this.internOpen()
                     }
                 },
                 this.nodeSettings.nodeHeartbeatTimeout - this.settings.nodeHeartbeatVariance,
@@ -350,8 +394,13 @@ export class StatefullNode {
 
     async unregisterNode(): Promise<void> {
         try {
-            const resp = await this.apiFetch("/node/unregister")
-            if (resp.status != 200) {
+            const resp = await this.apiFetch(
+                "/node/unregister",
+                {
+                    method: "post",
+                }
+            )
+            if (resp.status !== 200) {
                 const err: any = new Error(
                     "Status is not '200' on node unregister: " +
                     resp.status + ": " +
@@ -364,8 +413,8 @@ export class StatefullNode {
             }
             const node: Node = await resp.json()
             if (
-                typeof node != "object" ||
-                typeof node.id != "number"
+                typeof node !== "object" ||
+                typeof node.id !== "number"
             ) {
                 throw new Error("Register response not contains node")
             }
@@ -381,16 +430,17 @@ export class StatefullNode {
         try {
             let resp = await this.apiFetch(
                 "/node/heartbeat",
-                urlHeader ?
-                    {
-                        headers: {
+                {
+                    method: "post",
+                    headers: urlHeader ?
+                        {
                             [this.nodeSettings.nodeUrlHeader]: "" + this.nodeSettings.externalUrl,
-                        },
-                    } :
-                    undefined
+                        } :
+                        undefined,
+                }
             )
             body = await resp.text()
-            if (resp.status != 200) {
+            if (resp.status !== 200) {
                 const err: any = new Error(
                     "Status is not '200' on node heartbeat: " +
                     resp.status + ": " +
@@ -411,12 +461,12 @@ export class StatefullNode {
             ) {
                 throw err
             }
-            await this.internClose()
-            await this.internOpen()
+            await this.closeWebSocketServer()
+            await this.openWebSocketServer()
         }
     }
 
-    private async internOpen(): Promise<void> {
+    private async openWebSocketServer(): Promise<void> {
         while (this.settings.apiUrl.endsWith("/")) {
             this.settings.apiUrl = this.settings.apiUrl.slice(0, -1)
         }
@@ -441,65 +491,30 @@ export class StatefullNode {
         })
 
         const wsConnect = async (
-            sock: WebSocket,
+            ws: WebSocket,
             req: IncomingMessage,
         ) => {
-            const data: SocketData = {
-                ws: sock,
-                ep: undefined as any,
-                req: req,
-                session: undefined as any,
-            }
+            let sfws: StatefullWebSocket
             try {
-                data.ep = getWebSocketEndpoint(sock, req, this.settings.behindProxy)
-                sock.on("close", () => {
-                    delete this.sockets["" + data.ep.nid]
-                })
-                setTimeout(() => {
-                    if (data.session == undefined) {
-                        sock.close()
-                    }
-                }, 3000)
-                sock.on("message", async (buf: Buffer) => {
-                    const msg = buf.toString("utf8")
-                    if (data.session != undefined) {
-                        sock.emit("msg", msg)
-                    } else {
-                        if (!msg.startsWith(this.nodeSettings.jwtRequestPrefix)) {
-                            sock.close(undefined, "Session token not provided")
-                            return
-                        }
-                        const token = msg.substring(this.nodeSettings.jwtRequestPrefix.length)
-                        data.session = JWT.verify(
-                            token,
-                            this.nodeSettings.jwtSecret,
-                            {
-                                algorithms: [this.nodeSettings.jwtAlgorithm as any],
-                            },
-                        ) as any
-                        if (
-                            typeof data.session != "object" ||
-                            typeof data.session.id != "string" ||
-                            typeof data.session.new != "boolean"
-                        ) {
-                            throw new Error("Invalid client session")
-                        }
-                        this.sockets["" + data.ep.nid] = data
-                        data.ws.send(
-                            this.nodeSettings.jwtResponsePrefix +
-                            await this.settings.callback(data)
-                        )
-                    }
-                })
+                sfws = new StatefullWebSocket(
+                    this,
+                    ws,
+                    req,
+                )
             } catch (err) {
-                try {
-                    sock.close()
-                } catch (err) { }
-                this.settings.errorCallback(err, data)
+                if (
+                    ws.readyState === WebSocket.OPEN ||
+                    ws.readyState === WebSocket.CONNECTING
+                ) {
+                    ws.close(
+                        StatefullWebSocket.STATEFULL_ERROR,
+                        "STATEFULL_ERROR" + ":Unknown server error while connection!"
+                    )
+                }
+                this.settings.onError(this, err, sfws)
             }
         }
         this.wsServer.on('connection', wsConnect)
-
         let reconnectDelay = this.settings.minReconnectRetryDelay
         while (true) {
             try {
@@ -514,12 +529,13 @@ export class StatefullNode {
                 }
                 reconnectDelay += this.settings.reconnectRetryDelayIncrease
 
-                await this.settings.apiTimeoutCallback(
+                await this.settings.onApiTimeout(
                     this,
                     "Statefull API Timeout:\n" +
                     "  Can't reach api under '" + this.settings.apiUrl + "'.\n" +
                     "  Check if the api is reachable.\n" +
-                    "  Try reconnect in '" + reconnectDelay + "' ms..."
+                    "  Try reconnect in '" + reconnectDelay + "' ms...",
+                    err
                 )
                 if (reconnectDelay > this.settings.maxReconnectRetryDelay) {
                     reconnectDelay = this.settings.maxReconnectRetryDelay
@@ -533,20 +549,11 @@ export class StatefullNode {
             }
         }
         this.ready = true
-        await this.settings.openCallback(this)
     }
 
-    private async internClose(): Promise<void> {
+    private async closeWebSocketServer(): Promise<void> {
         this.ready = false
         let terr: Error | any
-        try {
-            await this.settings.closeCallback(this)
-        } catch (err) {
-            if (!terr) {
-                terr = err
-            }
-        }
-
         this.heartbeatId = -1
         try {
             await this.unregisterNode()
@@ -597,53 +604,61 @@ export class StatefullNode {
     }
 
     async open(): Promise<void> {
-        if (this.running) {
-            return
-        }
-        this.running = true
         try {
-            await this.internOpen()
+            if (this.running) {
+                return
+            }
+            this.running = true
+            await this.openWebSocketServer()
         } catch (err) {
-            try {
-                await this.internClose()
-            } catch (err) { }
-            this.running = false
+            await this.closeWebSocketServer()
             throw err
+        } finally {
+            this.running = false
         }
     }
 
     async close(): Promise<void> {
-        if (!this.running) {
-            return
-        }
         try {
-            await this.internClose()
-        } catch (err) { }
-        this.running = false
+            if (!this.running) {
+                return
+            }
+            await this.closeWebSocketServer()
+            this.running = false
+        } catch (err) {
+            throw err
+        }
     }
 
     async send(
-        ws: WebSocket,
-        message: string,
+        sfws: StatefullWebSocket,
+        data: JsonObject,
     ): Promise<void> {
         return new Promise<void>(
-            (res, rej) => ws.send(message, (err) => err ? rej(err) : res())
+            (res, rej) => sfws.originWs.send(
+                JSON.stringify(data),
+                (err) => err ? rej(err) : res()
+            )
         )
     }
 
     async broadcast(
-        from: SocketData | number,
-        message: string,
+        sfws: StatefullWebSocket,
+        data: JsonObject,
     ): Promise<void> {
-        if (typeof from != "number") {
-            from = from.ep.nid
-        }
+        const nid = sfws.ep.nid
+        const stringData = JSON.stringify(data)
         await Promise.all(
             Object.values(this.sockets).map((socketData) => {
-                if (socketData.ep.nid == from) {
+                if (socketData.ep.nid === nid) {
                     return
                 }
-                return this.send(socketData.ws, message)
+                return new Promise<void>(
+                    (res, rej) => sfws.originWs.send(
+                        stringData,
+                        (err) => err ? rej(err) : res()
+                    )
+                ).catch((err) => { })
             })
         )
     }
